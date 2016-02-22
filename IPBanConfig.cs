@@ -32,6 +32,8 @@ namespace IPBan
         private Regex blackListRegex;
         private readonly HashSet<string> allowedUserNames = new HashSet<string>();
         private bool banFileClearOnRestart;
+        private string windFileName;
+        private string windSFTPusers;
 
         /// <summary>
         /// Checks whether a user name should be banned after a failed login attempt. Cases where this would happen would be if the config has specified an allowed list of user names.
@@ -121,6 +123,12 @@ namespace IPBan
 
             value = ConfigurationManager.AppSettings["RuleName"];
             ruleName = value;
+
+            value = ConfigurationManager.AppSettings["windSFTPlog"];
+            windFileName = value;
+
+            value = ConfigurationManager.AppSettings["windSFTPusers"];
+            windSFTPusers = value;
 
             PopulateList(whiteList, ref whiteListRegex, ConfigurationManager.AppSettings["Whitelist"], ConfigurationManager.AppSettings["WhitelistRegex"]);
             PopulateList(blackList, ref blackListRegex, ConfigurationManager.AppSettings["Blacklist"], ConfigurationManager.AppSettings["BlacklistRegex"]);
@@ -234,5 +242,8 @@ namespace IPBan
         /// Allowed user names as a comma separated string
         /// </summary>
         public string AllowedUserNames { get { return string.Join(",", allowedUserNames); } }
+
+        public string WindSFTPLogFileName { get { return windFileName ?? string.Empty; } }
+        public string WindSFTPUsersFileName { get { return windSFTPusers ?? string.Empty; } }
     }
 }

@@ -19,6 +19,7 @@ using System.Security.Principal;
 using System.Web.Script.Serialization;
 using System.Xml;
 using System.Text.RegularExpressions;
+using NLog;
 
 #endregion Imports
 
@@ -43,6 +44,12 @@ namespace IPBan
         private Dictionary<string, DateTime> ipBlockerDate = new Dictionary<string, DateTime>();
         private DateTime lastConfigFileDateTime = DateTime.MinValue;
         private readonly ManualResetEvent cycleEvent = new ManualResetEvent(false);
+        private FileSystemWatcher fileWatcher;
+        private FileStream file;
+        private StreamReader streamReader;
+        private long offset = 0;
+        private long lastSize = 0;
+        private List<string> usernames; 
 
         private void ExecuteBanScript()
         {
@@ -398,6 +405,7 @@ namespace IPBan
             return queryString;
         }
 
+      
         private void SetupWatcher()
         {
             string queryString = GetQueryString();
@@ -407,6 +415,134 @@ namespace IPBan
             watcher = new EventLogWatcher(query);
             watcher.EventRecordWritten += EventRecordWritten;
             watcher.Enabled = true;
+
+            if (!string.IsNullOrEmpty(config.WindSFTPLogFileName) && File.Exists(config.WindSFTPLogFileName) && File.Exists(config.WindSFTPUsersFileName))
+            {
+
+                GetUsersFromFile();
+                file = new FileStream(config.WindSFTPLogFileName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                streamReader = new StreamReader(file);
+                lastSize = file.Length;
+                ProcessCurrentLogFile();
+
+                fileWatcher = new FileSystemWatcher
+                {
+                    Path = Path.GetDirectoryName(config.WindSFTPLogFileName),
+                    Filter = Path.GetFileName(config.WindSFTPLogFileName),
+                    NotifyFilter = NotifyFilters.LastWrite|NotifyFilters.Size
+                };
+                fileWatcher.Changed += FileWatcherOnChanged;
+                fileWatcher.EnableRaisingEvents = true;
+            }
+            
+        }
+
+        private void GetUsersFromFile()
+        {
+            usernames = new List<string>();
+            // Load the document and set the root element.
+            XmlDocument doc = new XmlDocument();
+            doc.Load(config.WindSFTPUsersFileName);
+            XmlNode root = doc.DocumentElement;
+            
+            // Select all nodes where the book price is greater than 10.00.
+            XmlNodeList nodeList = root.SelectNodes("//username");
+            foreach (XmlNode user in nodeList)
+            {
+                usernames.Add(user.InnerText);
+            }
+        }
+
+        private void ProcessCurrentLogFile()
+        {
+            // (?<=Denying Access to User: ).*?(?=\s)
+            // \b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b
+            
+            file.Seek(offset, SeekOrigin.Begin);
+
+            if (!streamReader.EndOfStream)
+            {
+                do
+                {
+                    string source = streamReader.ReadLine();
+                    Regex re = new Regex(@"(?<=Denying Access to User: ).*?(?=\s)");
+                    var mc = re.Matches(source);
+                    if (mc.Count > 0)
+                    {
+                        string user = mc[0].Groups[0].Value;
+                        string ip = string.Empty;
+
+                        re = new Regex(@"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b");  // should be able to combine with above regex somehow, but i'm not good with regex
+                        var ipm = re.Matches(source);
+                        ip = ipm[0].Groups[0].Value;
+                        ProcessIPAddress(ip);
+                    }
+
+                } while (!streamReader.EndOfStream);
+
+                offset = file.Position;
+            }
+            
+        }
+
+        private void ProcessIPAddress(string ipAddress)
+        {
+
+            lock (ipBlocker)
+            {
+                // Get the IPBlockCount, if one exists.
+                IPBlockCount ipBlockCount;
+                ipBlocker.TryGetValue(ipAddress, out ipBlockCount);
+                if (ipBlockCount == null)
+                {
+                    // This is the first failed login attempt, so record a new IPBlockCount.
+                    ipBlockCount = new IPBlockCount();
+                    ipBlocker[ipAddress] = ipBlockCount;
+                }
+
+                // Increment the count.
+                ipBlockCount.IncrementCount();
+
+                Log.Write(LogLevel.Info, "Incrementing count for ip {0} to {1}", ipAddress, ipBlockCount.Count);
+
+                // check for the target user name for additional blacklisting checks                    
+                bool blackListed = config.IsBlackListed(ipAddress) ;
+
+                // if the ip is black listed or they have reached the maximum failed login attempts before ban, ban them
+                if (blackListed || ipBlockCount.Count >= config.FailedLoginAttemptsBeforeBan)
+                {
+                    // if they are not black listed OR this is the first increment of a black listed ip address, perform the ban
+                    if (!blackListed || ipBlockCount.Count >= 1)
+                    {
+                        if (!ipBlockerDate.ContainsKey(ipAddress))
+                        {
+                            Log.Write(LogLevel.Error, "Banning ip address: {0}, black listed: {1}, count: {2}", ipAddress, blackListed, ipBlockCount.Count);
+                            ipBlockerDate[ipAddress] = DateTime.UtcNow;
+                            ExecuteBanScript();
+                        }
+                    }
+                    else
+                    {
+                        Log.Write(LogLevel.Info, "Ignoring previously banned black listed ip {0}, ip should already be banned", ipAddress);
+                    }
+                }
+                else if (ipBlockCount.Count > config.FailedLoginAttemptsBeforeBan)
+                {
+                    Log.Write(LogLevel.Warning, "Got event with ip address {0}, count {1}, ip should already be banned", ipAddress, ipBlockCount.Count);
+                }
+            }
+        }
+
+        private void FileWatcherOnChanged(object sender, FileSystemEventArgs fileSystemEventArgs)
+        {
+            if (file.Length < lastSize)
+            {
+                Log.Write(LogLevel.Info, "Log file got smaller. Probably reset for the day.");
+                lastSize = file.Length;
+                offset = 0;
+            }
+            
+            ProcessCurrentLogFile();
         }
 
         private void TestRemoteDesktopAttemptWithPAddress(string ipAddress, int count)
